@@ -849,111 +849,519 @@ function clearAnimationCache() {
     console.debug(DEBUG_PREFIX,"Cleared animation cache");
 }
 
+// Global state for lip sync cleanup between chunks
+let currentLipSyncCleanup = null;
+
+// Real-time lip sync using VoiceForge's shared analyser
+// Much simpler than per-chunk analysis - just reads actual audio output
+let realtimeLipSyncActive = false;
+let realtimeLipSyncCharacter = null;
+let realtimeLipSyncAnimationId = null;
+
+const REALTIME_MOUTH_THRESHOLD = 22;  // Higher threshold - mouth only opens on clear audio
+const REALTIME_MOUTH_BOOST = 8;
+const REALTIME_VOWEL_DAMP = 60;
+const REALTIME_VOWEL_MIN = 18;
+const REALTIME_MOUTH_CUTOFF = 0.1;  // Snap to 0 below this threshold
+const REALTIME_UPDATE_INTERVAL = 16; // ~60fps for smoother animation
+
+// Per-viseme decay rates - very aggressive for snappy closure at 60fps
+const VISEME_DECAY = {
+    aa: 0.5,   // Open mouth - decay per frame at 60fps
+    ee: 0.45,  // Spread lips - fast
+    ih: 0.45,  // Similar to ee
+    oh: 0.55,  // Round mouth - slightly slower
+    ou: 0.5,   // Pucker
+};
+
+function startRealtimeLipSync(character) {
+    if (realtimeLipSyncActive && realtimeLipSyncCharacter === character) {
+        return; // Already running for this character
+    }
+    
+    stopRealtimeLipSync(); // Stop any existing
+    
+    realtimeLipSyncActive = true;
+    realtimeLipSyncCharacter = character;
+    
+    console.debug(DEBUG_PREFIX, "Starting real-time lip sync for", character);
+    
+    let lastUpdate = 0;
+    
+    function animate() {
+        if (!realtimeLipSyncActive) return;
+        
+        const analyser = window.getVoiceForgeAnalyser?.();
+        if (!analyser || current_avatars[character] === undefined) {
+            realtimeLipSyncAnimationId = requestAnimationFrame(animate);
+            return;
+        }
+        
+        const now = Date.now();
+        if (now - lastUpdate < REALTIME_UPDATE_INTERVAL) {
+            realtimeLipSyncAnimationId = requestAnimationFrame(animate);
+            return;
+        }
+        lastUpdate = now;
+        
+        const expressionMgr = current_avatars[character]["vrm"].expressionManager;
+        
+        // Get frequency data from VoiceForge's actual audio output
+        const array = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(array);
+        
+        // Formant-based frequency band analysis
+        // Based on typical speech formant frequencies:
+        // - F1 (300-800Hz): Mouth openness
+        // - F2 (800-2500Hz): Front/back tongue position (ee vs ou)
+        const binCount = array.length;
+        const sampleRate = 48000; // Typical audio sample rate
+        const binHz = sampleRate / (binCount * 2);
+        
+        // Frequency bands based on formants
+        const veryLowEnd = Math.floor(400 / binHz);    // 0-400Hz (ou/oh base)
+        const lowEnd = Math.floor(800 / binHz);        // 400-800Hz (F1 - openness)
+        const midEnd = Math.floor(1500 / binHz);       // 800-1500Hz (aa region)
+        const highEnd = Math.floor(2500 / binHz);      // 1500-2500Hz (ee/ih F2)
+        
+        let veryLowSum = 0, lowSum = 0, midSum = 0, highSum = 0, totalSum = 0;
+        for (let i = 0; i < Math.min(binCount, highEnd + 50); i++) {
+            const val = array[i];
+            totalSum += val;
+            if (i < veryLowEnd) veryLowSum += val;
+            else if (i < lowEnd) lowSum += val;
+            else if (i < midEnd) midSum += val;
+            else if (i < highEnd) highSum += val;
+        }
+        
+        const veryLowAvg = veryLowSum / Math.max(1, veryLowEnd);
+        const lowAvg = lowSum / Math.max(1, lowEnd - veryLowEnd);
+        const midAvg = midSum / Math.max(1, midEnd - lowEnd);
+        const highAvg = highSum / Math.max(1, highEnd - midEnd);
+        const totalAvg = totalSum / Math.max(1, Math.min(binCount, highEnd + 50));
+        const inputVolume = totalAvg;
+        
+        if (inputVolume > (REALTIME_MOUTH_THRESHOLD * 2)) {
+            // Neutralize other expressions
+            for (const expression in expressionMgr.expressionMap) {
+                if (!['aa', 'ee', 'ih', 'oh', 'ou'].includes(expression)) {
+                    expressionMgr.setValue(expression, Math.min(0.25, expressionMgr.getValue(expression)));
+                }
+            }
+            
+            // Calculate base mouth opening from F1 region (overall energy)
+            const baseOpen = Math.min(1.0, ((totalAvg - REALTIME_VOWEL_MIN) / REALTIME_VOWEL_DAMP) * (REALTIME_MOUTH_BOOST / 10));
+            
+            // Determine viseme weights based on formant distribution
+            const totalEnergy = veryLowAvg + lowAvg + midAvg + highAvg + 0.1;
+            
+            // ou (oo): Very low F2, pucker - dominant very low frequencies
+            const ouWeight = (veryLowAvg * 1.5) / totalEnergy;
+            // oh (oh): Low F2, round mouth - low frequencies
+            const ohWeight = (lowAvg * 1.3 + veryLowAvg * 0.5) / totalEnergy;
+            // aa (ah): Mid F1/F2, open mouth - mid frequencies dominant
+            const aaWeight = (midAvg * 1.5 + lowAvg * 0.5) / totalEnergy;
+            // ee (eh): Higher F2, spread - mid-high frequencies
+            const eeWeight = (highAvg * 0.8 + midAvg * 0.4) / totalEnergy;
+            // ih (ee): Highest F2, spread lips - high frequencies
+            const ihWeight = (highAvg * 1.2) / totalEnergy;
+            
+            // Set viseme values directly for snappy response
+            expressionMgr.setValue("ou", Math.min(1.0, baseOpen * ouWeight * 1.0));
+            expressionMgr.setValue("oh", Math.min(1.0, baseOpen * ohWeight * 1.1));
+            expressionMgr.setValue("aa", Math.min(1.0, baseOpen * aaWeight * 1.3));
+            expressionMgr.setValue("ee", Math.min(1.0, baseOpen * eeWeight * 0.9));
+            expressionMgr.setValue("ih", Math.min(1.0, baseOpen * ihWeight * 0.7));
+        } else {
+            // Decay mouth closed - per-viseme decay rates for natural movement
+            const decayViseme = (name) => {
+                const current = expressionMgr.getValue(name) || 0;
+                const decayed = current * VISEME_DECAY[name];
+                return decayed < REALTIME_MOUTH_CUTOFF ? 0 : decayed;
+            };
+            expressionMgr.setValue("aa", decayViseme("aa"));
+            expressionMgr.setValue("ee", decayViseme("ee"));
+            expressionMgr.setValue("ih", decayViseme("ih"));
+            expressionMgr.setValue("oh", decayViseme("oh"));
+            expressionMgr.setValue("ou", decayViseme("ou"));
+        }
+        
+        realtimeLipSyncAnimationId = requestAnimationFrame(animate);
+    }
+    
+    realtimeLipSyncAnimationId = requestAnimationFrame(animate);
+}
+
+function stopRealtimeLipSync() {
+    if (realtimeLipSyncAnimationId) {
+        cancelAnimationFrame(realtimeLipSyncAnimationId);
+        realtimeLipSyncAnimationId = null;
+    }
+    
+    // Close mouth
+    if (realtimeLipSyncCharacter && current_avatars[realtimeLipSyncCharacter]) {
+        const expressionMgr = current_avatars[realtimeLipSyncCharacter]["vrm"].expressionManager;
+        expressionMgr.setValue("aa", 0);
+        expressionMgr.setValue("ee", 0);
+        expressionMgr.setValue("ih", 0);
+        expressionMgr.setValue("oh", 0);
+        expressionMgr.setValue("ou", 0);
+    }
+    
+    realtimeLipSyncActive = false;
+    realtimeLipSyncCharacter = null;
+    console.debug(DEBUG_PREFIX, "Stopped real-time lip sync");
+}
+
+// Expose for VoiceForge to control
+window.vrmStartLipSync = startRealtimeLipSync;
+window.vrmStopLipSync = stopRealtimeLipSync;
+
 // Perform audio lip sync
 // Overried text mouth movement
-async function audioTalk(blob, character) {
+// 
+// Parameters:
+//   blob: Audio blob to analyze
+//   character: Character name for VRM model lookup
+//   options: Optional object with:
+//     - webAudio: true if using Web Audio API for playback (VoiceForge gapless mode)
+//     - startTime: When audio will start playing (audioContext.currentTime value)
+//     - audioContext: Shared audio context from caller (for sync with Web Audio playback)
+//
+async function audioTalk(blob, character, options = {}) {
     // Option disable
     if (!extension_settings.vrm.tts_lips_sync)
         return;
-        /*return response;
-
-    console.debug(DEBUG_PREFIX,"Received lipsync",response, character);
-    let responseCopy;
-    try {
-        responseCopy = response.clone();
-    } catch(error) {
-        console.debug(DEBUG_PREFIX,"Wrong response format received abort lip sync");
-        return response;
-    }*/
+    
+    const useWebAudio = options.webAudio === true;
+    
+    // For Web Audio mode: use real-time lip sync from VoiceForge's shared analyser
+    // Much simpler and more reliable than per-chunk analysis
+    if (useWebAudio) {
+        startRealtimeLipSync(character);
+        return; // Real-time mode handles everything via animation loop
+    }
+    
+    // Audio element mode: use legacy per-blob analysis
+    if (currentLipSyncCleanup) {
+        try {
+            currentLipSyncCleanup();
+        } catch (e) {
+            console.debug(DEBUG_PREFIX, "Previous cleanup error (safe to ignore):", e.message);
+        }
+        currentLipSyncCleanup = null;
+    }
+    
     tts_lips_sync_job_id++;
     const job_id = tts_lips_sync_job_id;
-    console.debug(DEBUG_PREFIX,"Received lipsync",blob, character,job_id);
+    console.debug(DEBUG_PREFIX, "Received lipsync", blob, character, job_id, "(Audio Element mode)");
 
-    const audioContext = new(window.AudioContext || window.webkitAudioContext)();
-    const analyser = audioContext.createAnalyser();
-    analyser.smoothingTimeConstant = 0.5;
-    analyser.fftSize = 1024;
-
-    //const blob = await responseCopy.blob();
-    const arrayBuffer = await blob.arrayBuffer();
-
-    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-
-    const source = audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(analyser);
-
-    const javascriptNode = audioContext.createScriptProcessor(256, 1, 1);
-    analyser.connect(javascriptNode);
-    javascriptNode.connect(audioContext.destination);
-    const mouththreshold = 10;
-    const mouthboost = 10;
-
+    // Track state - set up BEFORE any async work
+    let sourceStarted = false;
+    let endTalkCalled = false;
+    let audioReady = false;
+    let audioContext = null;
+    let analyser = null;
+    let source = null;
+    let javascriptNode = null;
+    let audioDuration = 0;
+    let startTimestamp = 0;
+    
+    const mouththreshold = 8;   // Lower = responds to quieter audio (default 10)
+    const mouthboost = 14;      // Higher = wider mouth opening (default 10)
     let lastUpdate = 0;
-    const LIPS_SYNC_DELAY = 66;
+    const LIPS_SYNC_DELAY = 33;  // Faster updates for snappier lip sync (was 66ms = ~15fps, now ~30fps)
+    const MOUTH_DECAY = 0.65;   // How fast mouth closes during silence (0-1, lower = faster close)
+    
+    // For Web Audio mode: track when this chunk SHOULD be playing
+    const chunkStartTime = options.startTime || 0;  // audioContext time when chunk should start
+    const contextTimeAtCreation = options.audioContext ? options.audioContext.currentTime : 0;
+    
+    // Decode audio in background (don't block)
+    const setupAudio = async () => {
+        try {
+            // Use shared context if provided, otherwise create new one
+            audioContext = options.audioContext || new(window.AudioContext || window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            analyser.smoothingTimeConstant = 0.5;
+            analyser.fftSize = 1024;
 
-    function endTalk() {
-        source.stop(0);
-        source.disconnect();
-        analyser.disconnect();
-        javascriptNode.disconnect();
-        if (current_avatars[character] !== undefined)
-            current_avatars[character]["vrm"].expressionManager.setValue("aa", 0);
+            const arrayBuffer = await blob.arrayBuffer();
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            audioDuration = audioBuffer.duration;
 
-        audio.removeEventListener("ended", endTalk);
-        //javascriptNode.removeEventListener("onaudioprocess", onAudioProcess);
-    }
+            source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(analyser);
+
+            // For Web Audio mode, don't connect to destination (VoiceForge handles actual playback)
+            // Just use this for analysis
+            javascriptNode = audioContext.createScriptProcessor(256, 1, 1);
+            analyser.connect(javascriptNode);
+            
+            // Only connect to destination if we're not in Web Audio mode
+            // In Web Audio mode, VoiceForge plays the audio, we just analyze
+            if (!useWebAudio) {
+                javascriptNode.connect(audioContext.destination);
+            } else {
+                // Create a silent destination for the script processor
+                const silentGain = audioContext.createGain();
+                silentGain.gain.value = 0;
+                javascriptNode.connect(silentGain);
+                silentGain.connect(audioContext.destination);
+            }
+            
+            audioReady = true;
+            
+            // Set up source ended handler for clean termination
+            // But NOT in Web Audio mode - chunks run in parallel and shouldn't terminate each other
+            if (!useWebAudio) {
+                source.onended = () => {
+                    console.debug(DEBUG_PREFIX, "Lip sync source ended naturally");
+                    if (!endTalkCalled) {
+                        endTalk();
+                    }
+                };
+            } else {
+                // In Web Audio mode, just log when source ends (no termination)
+                source.onended = () => {
+                    console.debug(DEBUG_PREFIX, "Lip sync chunk analysis finished (Web Audio, not terminating)");
+                };
+            }
+            
+            // If audio already started playing, start the source now
+            if (sourceStarted && !endTalkCalled) {
+                // Always start immediately - time window checks in onAudioProcess handle timing
+                source.start(0);
+                javascriptNode.onaudioprocess = onAudioProcess;
+                console.debug(DEBUG_PREFIX, "Lip sync (async) started, duration:", audioDuration.toFixed(2) + "s");
+            }
+        } catch (e) {
+            console.debug(DEBUG_PREFIX, "Audio setup error:", e.message);
+        }
+    };
+    
+    // Start async setup but don't await
+    setupAudio();
 
     var audio = document.getElementById("tts_audio");
-    function startTalk() {
-        source.start(0);
-        audio.removeEventListener("onplay", startTalk);
-        //javascriptNode.removeEventListener("onaudioprocess", onAudioProcess);
-    }
-    audio.onplay = startTalk;
-    audio.onended = endTalk;
+    
+    function endTalk() {
+        // Prevent multiple calls
+        if (endTalkCalled) return;
+        endTalkCalled = true;
+        
+        // Clear global cleanup reference
+        if (currentLipSyncCleanup === endTalk) {
+            currentLipSyncCleanup = null;
+        }
+        
+        try {
+            if (source && sourceStarted) {
+                source.stop(0);
+            }
+            if (source) source.disconnect();
+            if (analyser) analyser.disconnect();
+            if (javascriptNode) javascriptNode.disconnect();
+            // Only close context if we created it (not shared)
+            if (audioContext && !options.audioContext) audioContext.close();
+        } catch (e) {
+            // Ignore cleanup errors - nodes may already be disconnected
+            console.debug(DEBUG_PREFIX, "Cleanup error (safe to ignore):", e.message);
+        }
+        
+        // Only reset mouth visemes in audio element mode (single audio)
+        // In Web Audio mode, another chunk might still be playing - don't reset
+        if (!useWebAudio && current_avatars[character] !== undefined) {
+            const expressionMgr = current_avatars[character]["vrm"].expressionManager;
+            expressionMgr.setValue("aa", 0);
+            expressionMgr.setValue("ee", 0);
+            expressionMgr.setValue("ih", 0);
+            expressionMgr.setValue("oh", 0);
+            expressionMgr.setValue("ou", 0);
+        }
 
+        if (!useWebAudio) {
+            audio.removeEventListener("play", startTalk);
+            audio.removeEventListener("ended", endTalk);
+        }
+    }
+    
+    // Register this job's cleanup function globally
+    currentLipSyncCleanup = endTalk;
+
+    function startTalk() {
+        if (sourceStarted || endTalkCalled) return; // Prevent double-start or start after cleanup
+        sourceStarted = true;
+        startTimestamp = Date.now();
+        
+        // If audio is ready, start the source and processing
+        if (audioReady && source && !endTalkCalled) {
+            try {
+                // Always start immediately - we use time window checks in onAudioProcess
+                // to determine when this chunk should actually animate
+                source.start(0);
+                javascriptNode.onaudioprocess = onAudioProcess;
+                
+                if (useWebAudio) {
+                    console.debug(DEBUG_PREFIX, "Lip sync chunk started, window:", chunkStartTime.toFixed(2), "-", (chunkStartTime + audioDuration).toFixed(2) + "s");
+                } else {
+                    console.debug(DEBUG_PREFIX, "Lip sync source started, duration:", audioDuration.toFixed(2) + "s");
+                }
+            } catch (e) {
+                console.debug(DEBUG_PREFIX, "Source start error:", e.message);
+            }
+        }
+        // If not ready yet, setupAudio() will start it when done
+        
+        if (!useWebAudio) {
+            audio.removeEventListener("play", startTalk);
+        }
+    }
+    
     function onAudioProcess() {
-        if(job_id != tts_lips_sync_job_id || audio.paused) {
-            console.debug(DEBUG_PREFIX,"TTS lip sync job",job_id,"terminated")
-            endTalk();
+        // Don't process if not ready or already ended
+        if (!audioReady || !sourceStarted || endTalkCalled) {
             return;
+        }
+        
+        // Check for termination conditions
+        if (useWebAudio) {
+            // In Web Audio mode, check if we're within this chunk's expected playback window
+            // This prevents early chunks from interfering with later chunks' animation
+            if (audioContext && audioDuration > 0) {
+                const now = audioContext.currentTime;
+                const chunkEnd = chunkStartTime + audioDuration;
+                
+                // Only animate if we're within this chunk's playback window (with small buffer)
+                if (now < chunkStartTime - 0.1 || now > chunkEnd + 0.3) {
+                    // Outside our window - don't animate, let other chunks handle it
+                    return;
+                }
+            }
+        } else {
+            // In audio element mode, check audio state
+            if (job_id != tts_lips_sync_job_id || audio.paused) {
+                console.debug(DEBUG_PREFIX, "TTS lip sync job", job_id, "terminated");
+                endTalk();
+                return;
+            }
         }
 
         var array = new Uint8Array(analyser.frequencyBinCount);
         analyser.getByteFrequencyData(array);
-        var values = 0;
-
-        var length = array.length;
-        for (var i = 0; i < length; i++) {
-            values += array[i];
+        
+        // Frequency band analysis for viseme selection
+        // Split spectrum into bands for different mouth shapes
+        const binCount = array.length;
+        const lowEnd = Math.floor(binCount * 0.15);   // 0-15% = low frequencies (oh/ou)
+        const midEnd = Math.floor(binCount * 0.4);    // 15-40% = mid frequencies (aa)
+        const highEnd = Math.floor(binCount * 0.7);   // 40-70% = high frequencies (ee/ih)
+        
+        let lowSum = 0, midSum = 0, highSum = 0, totalSum = 0;
+        for (let i = 0; i < binCount; i++) {
+            totalSum += array[i];
+            if (i < lowEnd) lowSum += array[i];
+            else if (i < midEnd) midSum += array[i];
+            else if (i < highEnd) highSum += array[i];
         }
+        
+        // Normalize by band size
+        const lowAvg = lowSum / lowEnd;
+        const midAvg = midSum / (midEnd - lowEnd);
+        const highAvg = highSum / (highEnd - midEnd);
+        const totalAvg = totalSum / binCount;
+        
+        var inputvolume = totalAvg * (audioContext.sampleRate / 48000); // Normalize threshold
 
-        // audio in expressed as one number
-        var average = values / length;
-        var inputvolume = average * (audioContext.sampleRate/48000); // Normalize the treshold
-
-        var voweldamp = 53;
-        var vowelmin = 12;
+        var voweldamp = 42;     // Lower = bigger movements (default 53)
+        var vowelmin = 10;      // Lower = responds to quieter audio (default 12)
+        
         if(lastUpdate < (Date.now() - LIPS_SYNC_DELAY)) {
             if (current_avatars[character] !== undefined) {
-                // Neutralize all expression in case setExpression called in parrallele
-                for(const expression in current_avatars[character]["vrm"].expressionManager.expressionMap)
-                    current_avatars[character]["vrm"].expressionManager.setValue(expression, Math.min(0.25, current_avatars[character]["vrm"].expressionManager.getValue(expression)));
+                const expressionMgr = current_avatars[character]["vrm"].expressionManager;
 
                 if (inputvolume > (mouththreshold * 2)) {
-                    const new_value = ((average - vowelmin) / voweldamp) * (mouthboost/10);
-                    current_avatars[character]["vrm"].expressionManager.setValue("aa", new_value);
+                    // Neutralize other expressions only when we have audio to animate
+                    for(const expression in expressionMgr.expressionMap) {
+                        if (!['aa', 'ee', 'ih', 'oh', 'ou'].includes(expression)) {
+                            expressionMgr.setValue(expression, Math.min(0.25, expressionMgr.getValue(expression)));
+                        }
+                    }
+                    
+                    // Calculate base mouth opening
+                    const baseOpen = Math.min(1.0, ((totalAvg - vowelmin) / voweldamp) * (mouthboost / 10));
+                    
+                    // Determine dominant frequency band for viseme selection
+                    const maxBand = Math.max(lowAvg, midAvg, highAvg);
+                    
+                    if (maxBand > vowelmin) {
+                        // Blend visemes based on frequency distribution
+                        const lowWeight = lowAvg / (lowAvg + midAvg + highAvg + 0.1);
+                        const midWeight = midAvg / (lowAvg + midAvg + highAvg + 0.1);
+                        const highWeight = highAvg / (lowAvg + midAvg + highAvg + 0.1);
+                        
+                        // Low frequencies = rounder mouth shapes (oh, ou)
+                        // Mid frequencies = open mouth (aa)
+                        // High frequencies = spread lips (ee, ih)
+                        
+                        const ohValue = baseOpen * lowWeight * 1.2;
+                        const ouValue = baseOpen * lowWeight * 0.8;
+                        const aaValue = baseOpen * midWeight * 1.5;  // aa is primary
+                        const eeValue = baseOpen * highWeight * 0.9;
+                        const ihValue = baseOpen * highWeight * 0.6;
+                        
+                        // Set all mouth visemes
+                        expressionMgr.setValue("oh", Math.min(1.0, ohValue));
+                        expressionMgr.setValue("ou", Math.min(1.0, ouValue));
+                        expressionMgr.setValue("aa", Math.min(1.0, aaValue));
+                        expressionMgr.setValue("ee", Math.min(1.0, eeValue));
+                        expressionMgr.setValue("ih", Math.min(1.0, ihValue));
+                    }
                 }
                 else {
-                    current_avatars[character]["vrm"].expressionManager.setValue("aa", 0);
+                    // Silence detected - gradually close mouth (decay)
+                    // This looks better than instant snap-shut, and handles gaps between chunks
+                    const currentAa = expressionMgr.getValue("aa") || 0;
+                    const currentEe = expressionMgr.getValue("ee") || 0;
+                    const currentIh = expressionMgr.getValue("ih") || 0;
+                    const currentOh = expressionMgr.getValue("oh") || 0;
+                    const currentOu = expressionMgr.getValue("ou") || 0;
+                    
+                    // Apply decay - mouth smoothly closes
+                    expressionMgr.setValue("aa", currentAa * MOUTH_DECAY);
+                    expressionMgr.setValue("ee", currentEe * MOUTH_DECAY);
+                    expressionMgr.setValue("ih", currentIh * MOUTH_DECAY);
+                    expressionMgr.setValue("oh", currentOh * MOUTH_DECAY);
+                    expressionMgr.setValue("ou", currentOu * MOUTH_DECAY);
                 }
             }
             lastUpdate = Date.now();
         }
     }
 
-    javascriptNode.onaudioprocess = onAudioProcess;
+    if (useWebAudio) {
+        // Web Audio mode: start immediately (VoiceForge handles actual playback timing)
+        // The audio analysis runs in parallel with VoiceForge's scheduled playback
+        startTalk();
+        
+        // Set up auto-end based on duration
+        setupAudio().then(() => {
+            if (audioDuration > 0 && !endTalkCalled) {
+                setTimeout(() => {
+                    if (!endTalkCalled && job_id === tts_lips_sync_job_id) {
+                        endTalk();
+                    }
+                }, (audioDuration + 0.5) * 1000);
+            }
+        });
+    } else {
+        // Audio element mode: Set up event listeners IMMEDIATELY (synchronously) so they're ready when audio plays
+        // The actual audio processing setup happens async in setupAudio()
+        audio.addEventListener("play", startTalk, { once: true });
+        audio.addEventListener("ended", endTalk, { once: true });
+    }
+    
     // TODO: restaure expression weight ?
 }
 
