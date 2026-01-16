@@ -3,7 +3,7 @@ import { GLTFLoader } from './lib/jsm/loaders/GLTFLoader.js';
 import { FBXLoader } from './lib/jsm/loaders/FBXLoader.js';
 import { OrbitControls } from './lib/jsm/controls/OrbitControls.js';
 import { VRMLoaderPlugin, VRMUtils } from './lib/three-vrm.module.js';
-import { loadBVHAnimation, loadMixamoAnimation } from './animationLoader.js';
+import { loadBVHAnimation, loadMixamoAnimation, loadVRMAAnimation } from './animationLoader.js';
 
 import { getRequestHeaders, saveSettings, saveSettingsDebounced, sendMessageAsUser } from '../../../../script.js';
 import { getContext, extension_settings, getApiUrl, doExtrasFetch, modules } from '../../../extensions.js';
@@ -563,6 +563,10 @@ async function loadAnimation(vrm, hipsHeight, motion_file_path) {
         if (motion_file_path.endsWith(".bvh")) {
             //console.debug(DEBUG_PREFIX,"Loading bvh file",motion_file_path);
             clip = await loadBVHAnimation(motion_file_path, vrm, hipsHeight);
+        }
+        else if (motion_file_path.endsWith(".vrma")) {
+            //console.debug(DEBUG_PREFIX,"Loading vrma file",motion_file_path);
+            clip = await loadVRMAAnimation(motion_file_path, vrm, hipsHeight);
         }
         else {
             //console.debug(DEBUG_PREFIX,"UNSUPORTED animation file");

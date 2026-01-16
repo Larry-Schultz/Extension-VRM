@@ -1,6 +1,7 @@
 import * as THREE from './lib/three.module.js';
 import { FBXLoader } from './lib/jsm/loaders/FBXLoader.js';
 import { BVHLoader } from './lib/jsm/loaders/BVHLoader.js';
+import { VRMALoader } from './lib/jsm/loaders/VRMALoader.js';
 
 import {
     DEBUG_PREFIX
@@ -9,7 +10,8 @@ import {
 export {
     mixamoVRMRigMap,
     loadMixamoAnimation,
-    loadBVHAnimation
+	loadBVHAnimation,
+	loadVRMAAnimation
 }
 
 /**
@@ -267,5 +269,25 @@ async function loadBVHAnimation( url, vrm, currentVRMHipsHeight ) {
 		return new THREE.AnimationClip( 'vrmAnimationBVH', clip.duration, tracks );
 
 	} );
+
+}
+
+/**
+ * Load VRMA animation (assumed JSON) and convert for three-vrm use.
+ * Expected .vrma JSON format:
+ * {
+ *   "duration": number,
+ *   "tracks": [ { "name": "bone.property", "times": [...], "values": [...] }, ... ]
+ * }
+ */
+async function loadVRMAAnimation( url, vrm, currentVRMHipsHeight ) {
+	const loader = new VRMALoader();
+	const result = await loader.loadAsync( url );
+
+	// result is expected to be { clip: AnimationClip }
+	const clip = result.clip ?? result;
+
+	// If vrm mapping is required (bone name remapping / scaling), callers can still post-process the clip.
+	return clip;
 
 }

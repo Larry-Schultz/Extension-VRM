@@ -1,0 +1,7 @@
+# Ignore example VRMA files
+examples/
+
+# Node / build artifacts (common)
+node_modules/
+dist/
+build/
