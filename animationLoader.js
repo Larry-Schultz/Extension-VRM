@@ -2,7 +2,6 @@ import * as THREE from './lib/three.module.js';
 
 import { FBXLoader } from './lib/jsm/loaders/FBXLoader.js';
 import { BVHLoader } from './lib/jsm/loaders/BVHLoader.js';
-import { VRMALoader } from './lib/jsm/loaders/VRMALoader.js';
 
 import {
     DEBUG_PREFIX
