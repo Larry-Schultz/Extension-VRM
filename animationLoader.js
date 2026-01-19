@@ -9,7 +9,7 @@ import {
 export {
 	mixamoVRMRigMap,
 	loadMixamoAnimation,
-	loadBVHAnimation,
+	loadBVHAnimation
 }
 
 /**
