@@ -16,39 +16,6 @@ export {
 	loadVRMAAnimation,
 	loadAnyAnimation
 }
-/**
- * Load VRMA animation, convert for three-vrm use, and return it.
- *
- * @param {string} url A url of vrma animation data
- * @param {VRM} vrm A target VRM
- * @returns {Promise<{skeleton: THREE.Skeleton, clip: THREE.AnimationClip}>} The loaded animation and skeleton
- */
-async function loadVRMAAnimation(url, vrm) {
-	const loader = new VRMALoader();
-	return loader.loadAsync(url, vrm);
-}
-
-/**
- * Load any supported animation type (.fbx, .bvh, .vrma) and return a unified result
- * @param {string} url Animation file URL
- * @param {VRM} vrm Target VRM
- * @param {number} currentVRMHipsHeight Hips height for scaling (optional, used for .fbx/.bvh)
- * @returns {Promise<{skeleton: THREE.Skeleton|null, clip: THREE.AnimationClip}>}
- */
-async function loadAnyAnimation(url, vrm, currentVRMHipsHeight) {
-	if (url.endsWith('.vrma')) {
-		return loadVRMAAnimation(url, vrm);
-	} else if (url.endsWith('.bvh')) {
-		// BVH returns only AnimationClip, so wrap in unified output
-		const clip = await loadBVHAnimation(url, vrm, currentVRMHipsHeight);
-		return { skeleton: null, clip };
-	} else if (url.endsWith('.fbx')) {
-		const clip = await loadMixamoAnimation(url, vrm, currentVRMHipsHeight);
-		return { skeleton: null, clip };
-	} else {
-		throw new Error('Unsupported animation format: ' + url);
-	}
-}
 
 /**
  * A map from Mixamo rig name to VRM Humanoid bone name
