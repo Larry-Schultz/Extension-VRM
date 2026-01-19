@@ -1,12 +1,10 @@
 import * as THREE from './lib/three.module.js';
-
 import { FBXLoader } from './lib/jsm/loaders/FBXLoader.js';
 import { BVHLoader } from './lib/jsm/loaders/BVHLoader.js';
 
 import {
     DEBUG_PREFIX
 } from "./constants.js";
-
 
 export {
 	mixamoVRMRigMap,
