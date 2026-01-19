@@ -13,8 +13,6 @@ export {
 	mixamoVRMRigMap,
 	loadMixamoAnimation,
 	loadBVHAnimation,
-	loadVRMAAnimation,
-	loadAnyAnimation
 }
 
 /**
